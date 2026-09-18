@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 import cv2
@@ -20,7 +19,10 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 
-IMAGE_SIZE = (865, 285)
+IMAGE_HEIGHT = 865
+IMAGE_WIDTH = 285
+INPUT_SHAPE = (IMAGE_HEIGHT, IMAGE_WIDTH, 3)
+CV2_SIZE = (IMAGE_WIDTH, IMAGE_HEIGHT)
 BATCH_SIZE = 2
 EPOCHS = 15
 LEARNING_RATE = 0.00005
@@ -32,22 +34,25 @@ MODEL_FILE = Path("cnn_sifirdan.keras")
 
 
 def preprocess_image(image):
-    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
 
     clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
     cl = clahe.apply(l)
     limg = cv2.merge((cl, a, b))
-    son = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
 
-    med_son = cv2.medianBlur(son, 3)
-    arka_plan = cv2.medianBlur(son, 37)
-    maske = cv2.addWeighted(med_son, 1, arka_plan, -1, 255)
-    return cv2.bitwise_and(maske, med_son)
+    median_image = cv2.medianBlur(enhanced, 3)
+    background = cv2.medianBlur(enhanced, 37)
+    mask = cv2.addWeighted(median_image, 1, background, -1, 255)
+
+    return cv2.bitwise_and(mask, median_image)
 
 
 def load_dataset():
-    df = pd.read_csv(LABELS_FILE, sep=",")
+    df = pd.read_csv(LABELS_FILE)
 
     files = sorted(
         file.name
@@ -55,52 +60,60 @@ def load_dataset():
         if file.is_file()
     )
 
-    img_list = []
+    csv_ids = df["id"].astype(str).tolist()
+    if files != csv_ids:
+        raise ValueError("Görüntü dosyaları ile CSV 'id' değerleri eşleşmiyor.")
+
+    images = []
     for filename in files:
         image = cv2.imread(str(IMAGE_DIR / filename))
         if image is None:
             raise ValueError(f"Görüntü okunamadı: {filename}")
-        img_list.append(preprocess_image(image))
 
-    x = np.array(img_list)
+        processed = preprocess_image(image)
+        if processed.shape[:2] != (IMAGE_HEIGHT, IMAGE_WIDTH):
+            processed = cv2.resize(processed, CV2_SIZE)
+
+        images.append(processed)
+
+    x = np.asarray(images, dtype=np.float32)
     y = df["durum"].to_numpy()
-
-    csv_ids = df["id"].tolist()
-    if files != csv_ids:
-        raise ValueError("Görüntü dosyaları ile CSV 'id' değerleri eşleşmiyor.")
 
     return x, y
 
 
 def build_model():
-    model = Sequential([
-        Input(shape=(*IMAGE_SIZE, 3)),
-
-        Conv2D(64, 3, data_format="channels_last", kernel_initializer="he_normal", activation="swish"),
-        BatchNormalization(),
-
-        Conv2D(64, 3, activation="swish"),
-        BatchNormalization(),
-        MaxPool2D(pool_size=(2, 2)),
-        Dropout(0.25),
-
-        Conv2D(32, 3, activation="swish"),
-        BatchNormalization(),
-        Conv2D(32, 3, activation="swish"),
-        BatchNormalization(),
-        Conv2D(32, 3, activation="swish"),
-        BatchNormalization(),
-        MaxPool2D(pool_size=(2, 2)),
-        Dropout(0.25),
-
-        Flatten(),
-        Dense(128, activation="swish"),
-        BatchNormalization(),
-        Dropout(0.2),
-
-        Dense(1),
-        Activation("sigmoid"),
-    ])
+    model = Sequential(
+        [
+            Input(shape=INPUT_SHAPE),
+            Conv2D(
+                64,
+                3,
+                data_format="channels_last",
+                kernel_initializer="he_normal",
+                activation="swish",
+            ),
+            BatchNormalization(),
+            Conv2D(64, 3, activation="swish"),
+            BatchNormalization(),
+            MaxPool2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            Conv2D(32, 3, activation="swish"),
+            BatchNormalization(),
+            Conv2D(32, 3, activation="swish"),
+            BatchNormalization(),
+            Conv2D(32, 3, activation="swish"),
+            BatchNormalization(),
+            MaxPool2D(pool_size=(2, 2)),
+            Dropout(0.25),
+            Flatten(),
+            Dense(128, activation="swish"),
+            BatchNormalization(),
+            Dropout(0.2),
+            Dense(1),
+            Activation("sigmoid"),
+        ]
+    )
 
     model.compile(
         loss="binary_crossentropy",
@@ -121,7 +134,10 @@ def train():
         shuffle=True,
     )
 
-    datagen = ImageDataGenerator(horizontal_flip=False, vertical_flip=False)
+    datagen = ImageDataGenerator(
+        horizontal_flip=False,
+        vertical_flip=False,
+    )
     data_generator = datagen.flow(
         x_train,
         y_train,
@@ -143,7 +159,6 @@ def train():
 
     history = model.fit(
         data_generator,
-        steps_per_epoch=1000,
         epochs=EPOCHS,
         validation_data=(x_val, y_val),
         callbacks=[lr],
@@ -160,7 +175,9 @@ def predict_video(model, video_path, output_path="sonucSifirdanModel.avi"):
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
 
     fourcc = cv2.VideoWriter_fourcc(*"XVID")
     out = cv2.VideoWriter(
@@ -170,33 +187,34 @@ def predict_video(model, video_path, output_path="sonucSifirdanModel.avi"):
         (frame_width, frame_height),
     )
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        processed = preprocess_image(frame)
-        processed = cv2.resize(processed, IMAGE_SIZE)
-        processed = processed.astype(np.float32)
-        processed = np.expand_dims(processed, axis=0)
+            processed = preprocess_image(frame)
+            processed = cv2.resize(processed, CV2_SIZE)
+            processed = processed.astype(np.float32)
+            processed = np.expand_dims(processed, axis=0)
 
-        prediction = model.predict(processed, verbose=0)[0][0]
-        result_text = "Kusurlu" if prediction < 0.5 else "Kusursuz"
+            prediction = model.predict(processed, verbose=0)[0][0]
+            result_text = "Kusurlu" if prediction < 0.5 else "Kusursuz"
 
-        cv2.putText(
-            frame,
-            result_text,
-            (frame_width - 200, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-        out.write(frame)
-
-    cap.release()
-    out.release()
+            cv2.putText(
+                frame,
+                result_text,
+                (max(10, frame_width - 200), 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            out.write(frame)
+    finally:
+        cap.release()
+        out.release()
 
 
 if __name__ == "__main__":
